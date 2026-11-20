@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""claude-panel — пульт сессий Claude.
+
+  claude-panel open             поднять пульт (или развернуть, если уже поднят)
+  claude-panel close            закрыть пульт и аудитор
+  claude-panel hide | show | toggle-hidden   убрать окно пульта с экрана совсем / вернуть (пульт при этом работает;
+                                скрытый сам не появляется — только по show, toggle-hidden или Ctrl+Alt+P)
+  claude-panel status           что запущено + сводка сессий
+  claude-panel restart-auditor  перезапустить аудитор внутри пульта
+  claude-panel tick             отправить аудитору проверку прямо сейчас
+  claude-panel auditor on|off|status   включить / выключить аудитора (флаг auditor.enabled в конфиге; то же — выключатель в пульте)
+  claude-panel auditor show|hide       показать / скрыть окно аудитора (auditor.window_visible); аудитор при этом работает
+  claude-panel board            сводка сессий текстом (без пульта)
+  claude-panel hook-start       хук SessionStart  (JSON на stdin; в stdout ничего): пульт + маркер сессии
+  claude-panel hook-stop        хук SessionEnd: строка «закрыта» в журнал сессий
+  claude-panel hook-prompt      хук UserPromptSubmit: сводка о других сессиях + свежие факты летописи в stdout
+  claude-panel journal-reap     найти сессии, умершие без SessionEnd → «оборвалась» в журнал + в очередь аудитору
+  claude-panel journal-backfill [ГГГГ-ММ-ДД]   разово: прошлые сессии (с даты) в журнал строкой «без отметки»
+  claude-panel journal-purge-bots [--archive] [--dry]   убрать из журнала строки бот-сессий (`claude -p` из скриптов)
+"""
+import os
+import sys
+
+APP_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, APP_DIR)
+
+
+def _hook_prompt():
+    try:
+        from claude_panel.hookprompt import main
+        main()
+    except Exception:
+        pass
+    sys.exit(0)
+
+
+def panel_pid():
+    from claude_panel import config as C
+    try:
+        pid = int(open(C.PANEL_PID).read().strip())
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            if b"claude_panel" in f.read():
+                return pid
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _log(msg):
+    from claude_panel import config as C
+    from datetime import datetime
+    try:
+        C.ensure_run_dir()
+        with open(C.PANEL_LOG, "a") as f:
+            f.write(f"{datetime.now():%F %T} {msg}\n")
+    except OSError:
+        pass
+
+
+def start_panel(by_hook=False):
+    """Поднять пульт отвязанным процессом. Вернёт pid или None."""
+    import fcntl
+    import subprocess
+    import time
+    from claude_panel import config as C
+    C.ensure_run_dir()
+    if not os.environ.get("DISPLAY"):
+        return None  # нет графического сеанса (ssh и т. п.) — пульт не поднимаем
+    with open(C.START_LOCK, "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        pid = panel_pid()
+        if pid:
+            return pid
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}
+        if by_hook:
+            env["CLAUDE_PANEL_BY_HOOK"] = "1"
+        with open(C.PANEL_LOG, "a") as log:
+            subprocess.Popen([sys.executable, "-m", "claude_panel.panel"], cwd=APP_DIR, env=env,
+                             stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                             start_new_session=True, close_fds=True)
+        for _ in range(40):  # ждём, пока пульт возьмёт свой lock (до 4 с)
+            time.sleep(0.1)
+            pid = panel_pid()
+            if pid:
+                return pid
+    return None
+
+
+def signal_panel(sig):
+    pid = panel_pid()
+    if not pid:
+        return False
+    os.kill(pid, sig)
+    return True
+
+
+def main():
+    import signal
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd == "hook-prompt":
+        _hook_prompt()
+    if cmd == "guard":  # PreToolUse-страж сессии аудитора; при любой ошибке — запрет (exit 2)
+        try:
+            from claude_panel.guard import main as guard_main
+            guard_main()
+        except SystemExit:
+            raise
+        except Exception as e:
+            sys.stderr.write(f"Пульт: страж аудитора не сработал ({e}) — действие запрещено.\n")
+            sys.exit(2)
+    from claude_panel import config as C
+    if cmd in ("hook-start", "hook-stop"):
+        # stdout хука SessionStart попадает в контекст сессии — поэтому молчим всегда
+        try:
+            raw = sys.stdin.read() if not sys.stdin.isatty() else ""
+            if os.environ.get(C.AUDITOR_ENV) == "1":
+                sys.exit(0)  # сессия самого аудитора — без рекурсии
+            import json
+            sid, data = "", {}
+            try:
+                data = json.loads(raw) if raw.strip() else {}
+                sid = data.get("session_id", "")
+            except ValueError:
+                pass
+            from claude_panel import journal as J
+            if cmd == "hook-start":
+                pid = start_panel(by_hook=True)
+                _log(f"hook-start sid={sid} claude_pid={os.environ.get('CLAUDE_PID', '?')} panel={pid}")
+                try:
+                    J.on_session_start(data)
+                except Exception as e:
+                    _log(f"journal start error: {e}")
+            else:
+                # пульт сам видит закрытие сессии и гаснет через autoclose_grace_s, если сессий не осталось
+                import time
+                t0 = time.time()
+                try:
+                    J.on_session_end(data)
+                except Exception as e:
+                    _log(f"journal end error: {e}")
+                _log(f"hook-stop sid={sid} reason={data.get('reason', '')} журнал {1000 * (time.time() - t0):.0f} мс")
+        except Exception as e:
+            _log(f"{cmd} error: {e}")
+        sys.exit(0)
+    if cmd == "open":
+        pid = panel_pid()
+        if pid and C.load_state().get("hidden"):
+            print(f"пульт работает (pid {pid}), но скрыт — показать: claude-panel show")
+        elif pid:
+            os.kill(pid, signal.SIGHUP)
+            print(f"пульт уже работает (pid {pid}) — развернул")
+        else:
+            pid = start_panel()
+            print(f"пульт запущен, pid {pid}" if pid else "не удалось запустить пульт (нет DISPLAY?) — см. " + C.PANEL_LOG)
+    elif cmd == "close":
+        import time
+        pid = panel_pid()
+        if not pid:
+            print("пульт не запущен")
+            return
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(30):
+            time.sleep(0.1)
+            if not panel_pid():
+                break
+        print("пульт закрыт")
+    elif cmd in ("hide", "show", "toggle-hidden"):
+        pid = panel_pid()
+        state = C.load_state()
+        hidden = {"hide": True, "show": False}.get(cmd, not state.get("hidden"))
+        if pid:
+            with open(os.path.join(C.RUN_DIR, "cmd"), "w") as f:
+                f.write("hide" if hidden else "show")
+            os.kill(pid, signal.SIGHUP)
+        else:  # пульт не запущен: запоминаем, а на «показать» ещё и поднимаем его
+            state["hidden"] = hidden
+            C.save_state(state)
+            if not hidden:
+                start_panel()
+        print("пульт скрыт (работает, окна нет) — вернуть: Ctrl+Alt+P или claude-panel show" if hidden
+              else "пульт показан")
+    elif cmd in ("collapse", "expand", "toggle"):
+        pid = panel_pid()
+        if not pid:
+            print("пульт не запущен")
+            return
+        with open(os.path.join(C.RUN_DIR, "cmd"), "w") as f:
+            f.write(cmd)
+        os.kill(pid, signal.SIGHUP)
+        print({"collapse": "свернул", "expand": "развернул", "toggle": "переключил"}[cmd])
+    elif cmd in ("restart-auditor", "tick") and not C.auditor_enabled(C.load_config()):
+        print("аудитор выключен — включить: claude-panel auditor on")
+    elif cmd == "restart-auditor":
+        print("аудитор перезапускается" if signal_panel(signal.SIGUSR1) else "пульт не запущен")
+    elif cmd == "tick":
+        print("тик отправлен (уйдёт, когда аудитор освободится)" if signal_panel(signal.SIGUSR2) else "пульт не запущен")
+    elif cmd == "auditor":
+        arg = sys.argv[2] if len(sys.argv) > 2 else "status"
+        if arg in ("on", "off", "show", "hide"):
+            if arg in ("on", "off"):
+                C.set_option("auditor", "enabled", arg == "on")
+            else:
+                C.set_option("auditor", "window_visible", arg == "show")
+            pid = panel_pid()
+            if pid:
+                with open(os.path.join(C.RUN_DIR, "cmd"), "w") as f:
+                    f.write("auditor")
+                os.kill(pid, signal.SIGHUP)
+            word = {"on": "аудитор включён", "off": "аудитор выключен",
+                    "show": "окно аудитора показано", "hide": "окно аудитора скрыто (аудитор работает)"}[arg]
+            print(word + ("" if pid else " (пульт не запущен — применится при запуске)"))
+        elif arg == "status":
+            cfg = C.load_config()
+            print(f"аудитор: {'включён' if C.auditor_enabled(cfg) else 'выключен'}, "
+                  f"окно: {'показано' if cfg['auditor'].get('window_visible', True) else 'скрыто'}")
+        else:
+            print("claude-panel auditor on|off|status|show|hide")
+            sys.exit(1)
+    elif cmd == "status":
+        pid = panel_pid()
+        print(f"пульт: {'работает, pid ' + str(pid) if pid else 'не запущен'}"
+              + (" · окно скрыто (показать: claude-panel show)" if C.load_state().get("hidden") else ""))
+        try:
+            import json
+            b = json.load(open(C.BOARD_JSON))
+            a = b.get("auditor")
+            if not C.auditor_enabled(C.load_config()):
+                print("аудитор: выключен")
+            else:
+                print(f"аудитор: {('pid ' + str(a['pid']) + ', ' + str(a['status'])) if a else 'не найден'}")
+            print(open(C.BOARD_TXT).read().rstrip())
+        except (OSError, ValueError):
+            pass
+        print(f"конфиг: {C.CONFIG_FILE}\nлог: {C.PANEL_LOG}\nданные: {C.RUN_DIR}")
+    elif cmd == "journal-reap":
+        from claude_panel import journal as J
+        lines = J.reap(C.load_config())
+        print("\n".join(lines) if lines else "оборвавшихся сессий нет")
+    elif cmd == "journal-backfill":
+        from datetime import datetime
+        from claude_panel import journal as J
+        from claude_panel.collector import Collector
+        since = sys.argv[2] if len(sys.argv) > 2 else "2026-10-16"
+        live = {r.get("sessionId") for r in Collector().live_records()}
+        lines = J.backfill(C.load_config(), datetime.strptime(since, "%Y-%m-%d").timestamp(), live)
+        print(f"добавлено строк: {len(lines)}")
+        for ln in lines:
+            print(ln[:200])
+    elif cmd == "journal-purge-bots":
+        from claude_panel import journal as J
+        res = J.purge_bot_lines(C.load_config(), archive="--archive" in sys.argv, dry="--dry" in sys.argv)
+        verb = "нашлось бы" if "--dry" in sys.argv else "убрано"
+        for path, gone in res.items():
+            print(f"{path}: {verb} строк бот-сессий: {len(gone)}")
+        if not res:
+            print("строк бот-сессий нет")
+    elif cmd == "board":
+        from claude_panel.collector import Collector, render_text
+        print(render_text(Collector().collect()).rstrip())
+    else:
+        print(__doc__.strip())
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

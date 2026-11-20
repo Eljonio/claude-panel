@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# runtime
+*.log
+*.pid
+*.tmp
+*.lock
+
+# local config, state and generated files (never commit real session data)
+config.json
+state.json
+audit.json
+board.json
+board.txt
+delta.txt
+
+# environment and secrets
+.env
+.env.*
+
+# editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
